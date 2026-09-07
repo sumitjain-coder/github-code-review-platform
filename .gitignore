@@ -34,3 +34,7 @@ Thumbs.db
 
 # Local development files
 *.local
+
+# GitHub App private key — never commit this
+*.pem
+
