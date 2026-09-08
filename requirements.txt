@@ -1,4 +1,7 @@
 google-genai
 python-dotenv
 Flask
+PyJWT
+cryptography
+requests
 Flask==3.0.3

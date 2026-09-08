@@ -1,10 +1,9 @@
 """
-PHASE 2: FLASK WEBHOOK RECEIVER
---------------------------------
-Goal: prove GitHub can actually reach our server and send us real
-pull_request event data. We do NOT call the AI yet, and we do NOT
-post anything back to GitHub yet — this phase is only about
-receiving and verifying events safely.
+PHASE 3: FULL PIPELINE — WEBHOOK -> DIFF -> AI -> COMMENT
+-----------------------------------------------------------
+Goal: when a PR is opened or updated, automatically fetch the real
+diff, send it to Gemini for review, and post the AI's review back
+as a comment on the PR itself — a full end-to-end loop.
 """
 
 import os
@@ -13,6 +12,9 @@ import hashlib
 import json
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+
+from github_client import get_installation_token, get_pr_diff, post_pr_comment
+from ai_reviewer import get_ai_review, format_review_as_markdown
 
 load_dotenv()
 
@@ -80,7 +82,40 @@ def webhook():
         # "opened"     -> a brand new PR was created
         # "synchronize" -> new commits were pushed to an existing PR
         if action in ("opened", "synchronize"):
-            print(">> This is a PR we should review (later phases will do this).")
+            print(">> Fetching diff and generating AI review...")
+
+            installation_id = payload.get("installation", {}).get("id")
+            owner = repo.get("owner", {}).get("login")
+            repo_name = repo.get("name")
+            pr_number = pr.get("number")
+
+            try:
+                # Step 1: Get a temporary token scoped to this installation
+                installation_token = get_installation_token(installation_id)
+
+                # Step 2: Fetch the actual code changes
+                diff_text = get_pr_diff(owner, repo_name, pr_number, installation_token)
+
+                if not diff_text:
+                    print(">> No reviewable text changes found in this PR (e.g. binary files only).")
+                else:
+                    # Step 3: Send the diff to Gemini for review
+                    review = get_ai_review(diff_text)
+
+                    if review is None:
+                        print(">> AI review failed (invalid JSON returned). Skipping comment.")
+                    else:
+                        # Step 4: Post the review back on the PR
+                        comment_body = format_review_as_markdown(review)
+                        post_pr_comment(owner, repo_name, pr_number, installation_token, comment_body)
+                        print(">> Review posted successfully on the PR.")
+
+            except Exception as e:
+                # We deliberately don't let a failed review crash the whole
+                # webhook handler — we log it and move on. GitHub still gets
+                # a 200 response either way (see below), since the event
+                # itself was received fine even if our review step failed.
+                print(f">> Something went wrong during the review process: {e}")
         else:
             print(f">> Ignoring action '{action}' for now.")
     else:
