@@ -4,4 +4,6 @@ Flask
 PyJWT
 cryptography
 requests
+Flask-SQLAlchemy
+PyMySQL
 Flask==3.0.3

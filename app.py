@@ -15,10 +15,24 @@ from dotenv import load_dotenv
 
 from github_client import get_installation_token, get_pr_diff, post_pr_comment
 from ai_reviewer import get_ai_review, format_review_as_markdown
+from database import db
+from persistence import save_review
 
 load_dotenv()
 
 app = Flask(__name__)
+
+# --- Database configuration ---
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False  # extra overhead we don't need
+
+db.init_app(app)
+
+with app.app_context():
+    # Creates any tables that don't exist yet, based on models.py.
+    # Safe to run every time — it won't touch tables that already exist.
+    import models  # noqa: F401 (must be imported so SQLAlchemy knows about the models)
+    db.create_all()
 
 WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
 
@@ -109,6 +123,18 @@ def webhook():
                         comment_body = format_review_as_markdown(review)
                         post_pr_comment(owner, repo_name, pr_number, installation_token, comment_body)
                         print(">> Review posted successfully on the PR.")
+
+                        # Step 5: Save everything to MySQL for history/dashboard later
+                        save_review(
+                            owner=owner,
+                            repo_name=repo_name,
+                            installation_id=installation_id,
+                            pr_number=pr_number,
+                            pr_title=pr.get("title"),
+                            pr_author=pr.get("user", {}).get("login"),
+                            review_data=review,
+                        )
+                        print(">> Review saved to database.")
 
             except Exception as e:
                 # We deliberately don't let a failed review crash the whole
