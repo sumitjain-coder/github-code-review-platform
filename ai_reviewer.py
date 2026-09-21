@@ -9,6 +9,7 @@ can call get_ai_review(diff_text) and get back structured JSON.
 
 import os
 import json
+import time
 from dotenv import load_dotenv
 from google import genai
 
@@ -27,6 +28,44 @@ client = genai.Client(api_key=api_key)
 # If you see a "model not found / no longer available" error,
 # Google's error message will tell you the current replacement name.
 MODEL_NAME = "gemini-3.6-flash"
+
+# How many times to retry if Gemini's servers are temporarily
+# overloaded (503 errors), and how long to wait between tries.
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 5
+
+
+def _call_gemini_with_retry(prompt):
+    """
+    Calls Gemini, automatically retrying a few times if the failure
+    looks temporary (like a 503 "server overloaded" error) rather
+    than a real problem with our request. Returns the raw text
+    response, or None if every attempt failed.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+            )
+            return response.text.strip()
+
+        except Exception as e:
+            error_text = str(e)
+            is_temporary_error = "503" in error_text or "UNAVAILABLE" in error_text
+
+            if is_temporary_error and attempt < MAX_RETRIES:
+                print(
+                    f"Gemini is temporarily overloaded (attempt {attempt}/{MAX_RETRIES}). "
+                    f"Retrying in {RETRY_DELAY_SECONDS} seconds..."
+                )
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+
+            # Either it's not a temporary error, or we're out of
+            # retries — give up and let the caller handle it.
+            print(f"Gemini call failed permanently: {error_text}")
+            return None
 
 
 def get_ai_review(diff_text):
@@ -73,11 +112,9 @@ Rules:
 - If there are no meaningful issues, return an empty "findings" list — do not invent problems.
 """
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-    )
-    raw_text = response.text.strip()
+    raw_text = _call_gemini_with_retry(prompt)
+    if raw_text is None:
+        return None
 
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")

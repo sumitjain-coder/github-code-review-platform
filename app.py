@@ -13,8 +13,15 @@ import json
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-from github_client import get_installation_token, get_pr_diff, post_pr_comment
+from github_client import (
+    get_installation_token,
+    fetch_pr_files,
+    build_diff_text,
+    post_pr_review,
+    post_pr_comment,
+)
 from ai_reviewer import get_ai_review, format_review_as_markdown
+from diff_utils import build_line_to_position_map
 from database import db
 from persistence import save_review
 
@@ -107,8 +114,10 @@ def webhook():
                 # Step 1: Get a temporary token scoped to this installation
                 installation_token = get_installation_token(installation_id)
 
-                # Step 2: Fetch the actual code changes
-                diff_text = get_pr_diff(owner, repo_name, pr_number, installation_token)
+                # Step 2: Fetch the actual changed files (raw, so we can
+                # both build AI prompt text AND map line numbers later)
+                files = fetch_pr_files(owner, repo_name, pr_number, installation_token)
+                diff_text = build_diff_text(files)
 
                 if not diff_text:
                     print(">> No reviewable text changes found in this PR (e.g. binary files only).")
@@ -119,12 +128,73 @@ def webhook():
                     if review is None:
                         print(">> AI review failed (invalid JSON returned). Skipping comment.")
                     else:
-                        # Step 4: Post the review back on the PR
-                        comment_body = format_review_as_markdown(review)
-                        post_pr_comment(owner, repo_name, pr_number, installation_token, comment_body)
-                        print(">> Review posted successfully on the PR.")
+                        # Step 4: Build a position map for each changed file,
+                        # so we can translate the AI's line numbers into the
+                        # "position" GitHub's inline comments require.
+                        position_maps_by_file = {}
+                        for file in files:
+                            if file.get("patch"):
+                                position_maps_by_file[file["filename"]] = build_line_to_position_map(file["patch"])
 
-                        # Step 5: Save everything to MySQL for history/dashboard later
+                        inline_comments = []
+                        unmapped_findings = []  # findings we couldn't attach inline
+
+                        severity_emoji = {"critical": "🔴", "warning": "🟡", "suggestion": "🔵"}
+
+                        for finding in review.get("findings", []):
+                            file_path = finding.get("file")
+                            line_number = finding.get("line")
+                            position_map = position_maps_by_file.get(file_path, {})
+                            position = position_map.get(line_number)
+
+                            comment_text = (
+                                f"{severity_emoji.get(finding.get('severity'), '⚪')} "
+                                f"**{finding.get('severity', '').upper()}**\n\n"
+                                f"**Issue:** {finding.get('issue')}\n\n"
+                                f"**Why it matters:** {finding.get('why_it_matters')}\n\n"
+                                f"**Suggested fix:** {finding.get('suggested_fix')}"
+                            )
+
+                            if position is not None:
+                                inline_comments.append({
+                                    "path": file_path,
+                                    "position": position,
+                                    "body": comment_text,
+                                })
+                            else:
+                                # The AI's guessed line number didn't land on
+                                # a real diff line — don't lose the finding,
+                                # just fall back to mentioning it in the
+                                # overall summary instead.
+                                unmapped_findings.append(finding)
+
+                        # Step 5: Build the overall summary body
+                        summary_body = (
+                            f"## 🤖 AI Code Review\n\n"
+                            f"**Summary:** {review.get('plain_english_summary')}\n\n"
+                            f"**Impact:** {review.get('impact_summary')}\n"
+                        )
+
+                        if not review.get("findings"):
+                            summary_body += "\nNo significant issues found. ✅"
+
+                        if unmapped_findings:
+                            summary_body += "\n\n### Additional notes (couldn't attach to an exact line)\n"
+                            for f in unmapped_findings:
+                                summary_body += f"- **{f.get('file')}**: {f.get('issue')}\n"
+
+                        # Step 6: Post everything as one review — summary +
+                        # all inline comments together in a single API call.
+                        if inline_comments:
+                            post_pr_review(owner, repo_name, pr_number, installation_token, summary_body, inline_comments)
+                            print(f">> Review posted with {len(inline_comments)} inline comment(s).")
+                        else:
+                            # No findings mapped inline (or no findings at
+                            # all) — just post the summary as a plain comment.
+                            post_pr_comment(owner, repo_name, pr_number, installation_token, summary_body)
+                            print(">> Summary comment posted (no inline comments this time).")
+
+                        # Step 7: Save everything to MySQL for history/dashboard later
                         save_review(
                             owner=owner,
                             repo_name=repo_name,

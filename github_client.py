@@ -70,11 +70,12 @@ def get_installation_token(installation_id):
     return response.json()["token"]
 
 
-def get_pr_diff(owner, repo, pr_number, installation_token):
+def fetch_pr_files(owner, repo, pr_number, installation_token):
     """
-    Fetches the list of changed files in a PR, and combines their
-    individual patches into one diff-like text block we can hand
-    to the AI.
+    Fetches the raw list of changed files in a PR, each with its
+    filename and patch. We keep this "raw" so callers can use the
+    patches both for building AI prompt text AND for diff-position
+    mapping (Phase 5) — two different uses of the same data.
     """
     url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/files"
     headers = {
@@ -84,23 +85,66 @@ def get_pr_diff(owner, repo, pr_number, installation_token):
 
     response = requests.get(url, headers=headers)
     response.raise_for_status()
-    files = response.json()
+    return response.json()
 
+
+def build_diff_text(files):
+    """
+    Combines each file's patch into one text block suitable for
+    sending to the AI. Files with no patch (e.g. binary files) are
+    skipped.
+    """
     combined_diff_parts = []
     for file in files:
         filename = file.get("filename")
-        patch = file.get("patch")  # some files (e.g. binary, renamed-only) have no patch
+        patch = file.get("patch")
         if patch:
             combined_diff_parts.append(f"--- {filename} ---\n{patch}")
 
     return "\n\n".join(combined_diff_parts)
 
 
+def get_pr_diff(owner, repo, pr_number, installation_token):
+    """
+    Convenience function kept for backwards compatibility: fetches
+    files and immediately returns the combined diff text.
+    """
+    files = fetch_pr_files(owner, repo, pr_number, installation_token)
+    return build_diff_text(files)
+
+
+def post_pr_review(owner, repo, pr_number, installation_token, body, comments):
+    """
+    Posts a full "review" — a general summary comment (body) plus a
+    list of inline comments attached to exact lines. Each item in
+    "comments" must be a dict: {"path": ..., "position": ..., "body": ...}
+
+    event="COMMENT" means this just leaves feedback without formally
+    approving or requesting changes — the right choice for an
+    automated bot rather than a human decision.
+    """
+    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+    headers = {
+        "Authorization": f"Bearer {installation_token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    payload = {
+        "body": body,
+        "event": "COMMENT",
+        "comments": comments,
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    return response.json()
+
+
 def post_pr_comment(owner, repo, pr_number, installation_token, body):
     """
-    Posts a single comment on the PR. Note: PR comments use the
-    "issues" endpoint in GitHub's API — every PR is internally also
-    an "issue," which is a common source of confusion.
+    Posts a single, simple comment (no inline attachments). Kept
+    around as a fallback for cases where inline commenting isn't
+    possible (e.g. every finding failed to map to a diff position).
     """
     url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/issues/{pr_number}/comments"
     headers = {
