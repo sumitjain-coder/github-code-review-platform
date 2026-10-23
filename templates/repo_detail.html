@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}{{ repo.owner }}/{{ repo.name }} · AI Code Review{% endblock %}
+
+{% block content %}
+<nav class="crumbs">
+  <a href="{{ url_for('repos_page') }}">Repositories</a> › {{ repo.owner }}/{{ repo.name }}
+</nav>
+
+<h1>{{ repo.owner }}/{{ repo.name }}</h1>
+<p class="muted">A pull request (PR) is a proposal to add code changes to a project. Here is every PR the AI has looked at.</p>
+
+{% if rows %}
+  <div class="card table-card">
+    <table>
+      <thead>
+        <tr>
+          <th>PR</th>
+          <th>Title</th>
+          <th>Author</th>
+          <th>Status</th>
+          <th>Findings</th>
+          <th>Last reviewed</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+          <tr>
+            <td><a href="{{ url_for('review_page', pr_id=row.pr.id) }}">#{{ row.pr.pr_number }}</a></td>
+            <td><a href="{{ url_for('review_page', pr_id=row.pr.id) }}">{{ row.pr.title }}</a></td>
+            <td>{{ row.pr.author }}</td>
+            <td>
+              {% if row.review %}
+                <span class="badge status-ok">Reviewed</span>
+              {% else %}
+                <span class="badge status-pending">Pending</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.review %}
+                {% if row.counts.critical or row.counts.warning or row.counts.suggestion %}
+                  <span class="badge sev-critical">{{ row.counts.critical }}</span>
+                  <span class="badge sev-warning">{{ row.counts.warning }}</span>
+                  <span class="badge sev-suggestion">{{ row.counts.suggestion }}</span>
+                {% else %}
+                  <span class="muted">None ✅</span>
+                {% endif %}
+              {% else %}
+                <span class="muted">—</span>
+              {% endif %}
+            </td>
+            <td class="muted">
+              {% if row.review %}{{ row.review.created_at.strftime('%d %b %Y, %H:%M') }} UTC{% else %}—{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <div class="card empty"><h2>No pull requests yet</h2></div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}PR #{{ pr.pr_number }} · AI Code Review{% endblock %}
+
+{% block content %}
+<nav class="crumbs">
+  <a href="{{ url_for('repos_page') }}">Repositories</a> ›
+  <a href="{{ url_for('repo_page', repo_id=repo.id) }}">{{ repo.owner }}/{{ repo.name }}</a> ›
+  PR #{{ pr.pr_number }}
+</nav>
+
+<div class="page-head">
+  <div>
+    <h1>{{ pr.title }}</h1>
+    <p class="muted">Pull request #{{ pr.pr_number }} by <strong>{{ pr.author }}</strong></p>
+  </div>
+  <div class="rerun">
+    <button id="rerun-btn" class="btn" data-pr-id="{{ pr.id }}">↻ Re-run review</button>
+    <p id="rerun-status" class="muted small" role="status"></p>
+  </div>
+</div>
+
+{% if not review %}
+  <div class="card empty">
+    <h2>No review saved yet</h2>
+    <p>Click “Re-run review” to generate one.</p>
+  </div>
+{% else %}
+
+  <p class="muted small">
+    Review from {{ review.created_at.strftime('%d %b %Y, %H:%M') }} UTC
+    {% if history|length > 1 %}· {{ history|length }} reviews in history (see the bottom of this page){% endif %}
+  </p>
+
+  <section class="explain-grid">
+    <div class="card explain">
+      <h2>📖 What does this change do?</h2>
+      <p class="big">{{ review.plain_english_summary }}</p>
+    </div>
+    <div class="card explain">
+      <h2>🎯 What could it affect?</h2>
+      <p class="big">{{ review.impact_summary }}</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Things the AI found</h2>
+
+    {% if findings %}
+      <div class="badges spaced">
+        <span class="badge sev-critical">{{ counts.critical }} critical</span>
+        <span class="badge sev-warning">{{ counts.warning }} warning</span>
+        <span class="badge sev-suggestion">{{ counts.suggestion }} suggestion</span>
+      </div>
+
+      {% for f in findings %}
+        <article class="card finding sev-border-{{ f.severity }}">
+          <div class="finding-head">
+            <span class="badge sev-{{ f.severity }}">{{ (f.severity or 'note')|upper }}</span>
+            <code>{{ f.file_path }}{% if f.line_number %}:{{ f.line_number }}{% endif %}</code>
+          </div>
+
+          <h3>What’s wrong</h3>
+          <p>{{ f.issue }}</p>
+
+          <h3>Why should I care?</h3>
+          <p>{{ f.why_it_matters }}</p>
+
+          <h3>How do I fix it?</h3>
+          <p>{{ f.suggested_fix }}</p>
+        </article>
+      {% endfor %}
+    {% else %}
+      <div class="card empty">
+        <h2>No issues found ✅</h2>
+        <p>The AI didn’t spot anything worth flagging in this change.</p>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="card legend">
+    <h2>What do the colours mean?</h2>
+    <p><span class="badge sev-critical">CRITICAL</span> A real bug or security problem. Fix this before merging.</p>
+    <p><span class="badge sev-warning">WARNING</span> Something risky or likely to cause trouble later. Worth fixing.</p>
+    <p><span class="badge sev-suggestion">SUGGESTION</span> A way to make the code cleaner or easier to read. Optional.</p>
+    <p class="muted small">The AI can make mistakes. Treat its findings as a second opinion, not the final word.</p>
+  </section>
+
+  {% if history|length > 1 %}
+    <section>
+      <h2>Review history</h2>
+      <div class="card table-card">
+        <table>
+          <tbody>
+            {% for r in history %}
+              <tr>
+                <td>
+                  <a href="{{ url_for('review_page', pr_id=pr.id, review=r.id) }}">
+                    {{ r.created_at.strftime('%d %b %Y, %H:%M') }} UTC
+                  </a>
+                  {% if r.id == review.id %}<span class="badge status-ok">viewing</span>{% endif %}
+                </td>
+                <td class="muted">{{ r.findings|length }} finding{{ '' if r.findings|length == 1 else 's' }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endif %}
+
+{% endif %}
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Repositories · AI Code Review{% endblock %}
+
+{% block content %}
+<h1>Connected repositories</h1>
+<p class="muted">Every repository where the GitHub App is installed and has reviewed at least one pull request.</p>
+
+{% if repo_cards %}
+  <div class="grid">
+    {% for item in repo_cards %}
+      <a class="card card-link" href="{{ url_for('repo_page', repo_id=item.repo.id) }}">
+        <h2>{{ item.repo.owner }}/{{ item.repo.name }}</h2>
+        <p class="muted">{{ item.pr_count }} pull request{{ '' if item.pr_count == 1 else 's' }} reviewed</p>
+        <div class="badges">
+          <span class="badge sev-critical">{{ item.totals.critical }} critical</span>
+          <span class="badge sev-warning">{{ item.totals.warning }} warning</span>
+          <span class="badge sev-suggestion">{{ item.totals.suggestion }} suggestion</span>
+        </div>
+      </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="card empty">
+    <h2>Nothing here yet</h2>
+    <p>Open a pull request on a repository where your GitHub App is installed. Once the review finishes, the repository will show up here.</p>
+  </div>
+{% endif %}
+{% endblock %}

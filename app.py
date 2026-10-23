@@ -1,29 +1,25 @@
 """
-PHASE 3: FULL PIPELINE — WEBHOOK -> DIFF -> AI -> COMMENT
------------------------------------------------------------
-Goal: when a PR is opened or updated, automatically fetch the real
-diff, send it to Gemini for review, and post the AI's review back
-as a comment on the PR itself — a full end-to-end loop.
+FLASK APP: WEBHOOK RECEIVER + DASHBOARD
+-----------------------------------------
+- /webhook             GitHub sends PR events here (protected by HMAC signature)
+- /                    Dashboard: connected repositories
+- /repo/<id>           Dashboard: pull requests for one repository
+- /pr/<id>             Dashboard: review details for one pull request
+- /api/pr/<id>/rerun   Dashboard button: re-run the AI review
+
+The review logic itself lives in review_service.py.
 """
 
 import os
 import hmac
 import hashlib
 import json
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template, Response, abort
 from dotenv import load_dotenv
 
-from github_client import (
-    get_installation_token,
-    fetch_pr_files,
-    build_diff_text,
-    post_pr_review,
-    post_pr_comment,
-)
-from ai_reviewer import get_ai_review, format_review_as_markdown
-from diff_utils import build_line_to_position_map
 from database import db
-from persistence import save_review
+from models import Repository, PullRequest, Review
+from review_service import run_review_pipeline
 
 load_dotenv()
 
@@ -31,17 +27,15 @@ app = Flask(__name__)
 
 # --- Database configuration ---
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False  # extra overhead we don't need
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db.init_app(app)
 
 with app.app_context():
-    # Creates any tables that don't exist yet, based on models.py.
-    # Safe to run every time — it won't touch tables that already exist.
-    import models  # noqa: F401 (must be imported so SQLAlchemy knows about the models)
-    db.create_all()
+    db.create_all()  # only creates tables that don't exist yet
 
 WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
 
 if not WEBHOOK_SECRET:
     raise ValueError(
@@ -49,37 +43,59 @@ if not WEBHOOK_SECRET:
         "the secret you typed into your GitHub App's webhook settings."
     )
 
+if not DASHBOARD_PASSWORD:
+    raise ValueError(
+        "DASHBOARD_PASSWORD is missing from .env — add any password you "
+        "like. It protects the dashboard, since ngrok makes it public."
+    )
 
+
+# ---------------------------------------------------------------
+# Dashboard password protection (HTTP Basic Auth)
+# ---------------------------------------------------------------
+# Runs before every request. /webhook and /health are skipped:
+# GitHub can't type a password, and /webhook has its own signature
+# check instead. Your browser shows a login popup; username is
+# "admin", password is DASHBOARD_PASSWORD from .env.
+@app.before_request
+def require_dashboard_login():
+    if request.path in ("/webhook", "/health"):
+        return None
+
+    auth = request.authorization
+    if auth and auth.username == "admin" and hmac.compare_digest(
+        auth.password or "", DASHBOARD_PASSWORD
+    ):
+        return None
+
+    return Response(
+        "Login required.", 401,
+        {"WWW-Authenticate": 'Basic realm="Code Review Dashboard"'},
+    )
+
+
+# ---------------------------------------------------------------
+# Webhook (unchanged behavior, much shorter now)
+# ---------------------------------------------------------------
 def verify_signature(payload_body, signature_header):
-    """
-    GitHub signs every webhook request using our shared secret.
-    This function recalculates that signature ourselves and compares
-    it to the one GitHub sent. If they don't match, either the secret
-    is wrong, or the request didn't really come from GitHub at all.
-    """
     if signature_header is None:
         return False
 
-    # GitHub sends the signature as "sha256=<hexdigest>"
     expected_signature = "sha256=" + hmac.new(
         key=WEBHOOK_SECRET.encode("utf-8"),
         msg=payload_body,
         digestmod=hashlib.sha256,
     ).hexdigest()
 
-    # hmac.compare_digest prevents "timing attacks" — a security best
-    # practice for comparing secret values instead of using "==".
     return hmac.compare_digest(expected_signature, signature_header)
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     signature_header = request.headers.get("X-Hub-Signature-256")
-    payload_body = request.get_data()  # raw bytes, needed for signature check
+    payload_body = request.get_data()
 
     if not verify_signature(payload_body, signature_header):
-        # Someone (or something) sent us a request that isn't really
-        # from GitHub. Reject it.
         return jsonify({"error": "Invalid signature"}), 401
 
     event_type = request.headers.get("X-GitHub-Event")
@@ -99,134 +115,145 @@ def webhook():
         print(f"PR #{pr.get('number')}: {pr.get('title')}")
         print(f"Author: {pr.get('user', {}).get('login')}")
 
-        # We only care about these two actions for now:
-        # "opened"     -> a brand new PR was created
-        # "synchronize" -> new commits were pushed to an existing PR
         if action in ("opened", "synchronize"):
             print(">> Fetching diff and generating AI review...")
-
-            installation_id = payload.get("installation", {}).get("id")
-            owner = repo.get("owner", {}).get("login")
-            repo_name = repo.get("name")
-            pr_number = pr.get("number")
-
-            try:
-                # Step 1: Get a temporary token scoped to this installation
-                installation_token = get_installation_token(installation_id)
-
-                # Step 2: Fetch the actual changed files (raw, so we can
-                # both build AI prompt text AND map line numbers later)
-                files = fetch_pr_files(owner, repo_name, pr_number, installation_token)
-                diff_text = build_diff_text(files)
-
-                if not diff_text:
-                    print(">> No reviewable text changes found in this PR (e.g. binary files only).")
-                else:
-                    # Step 3: Send the diff to Gemini for review
-                    review = get_ai_review(diff_text)
-
-                    if review is None:
-                        print(">> AI review failed (invalid JSON returned). Skipping comment.")
-                    else:
-                        # Step 4: Build a position map for each changed file,
-                        # so we can translate the AI's line numbers into the
-                        # "position" GitHub's inline comments require.
-                        position_maps_by_file = {}
-                        for file in files:
-                            if file.get("patch"):
-                                position_maps_by_file[file["filename"]] = build_line_to_position_map(file["patch"])
-
-                        inline_comments = []
-                        unmapped_findings = []  # findings we couldn't attach inline
-
-                        severity_emoji = {"critical": "🔴", "warning": "🟡", "suggestion": "🔵"}
-
-                        for finding in review.get("findings", []):
-                            file_path = finding.get("file")
-                            line_number = finding.get("line")
-                            position_map = position_maps_by_file.get(file_path, {})
-                            position = position_map.get(line_number)
-
-                            comment_text = (
-                                f"{severity_emoji.get(finding.get('severity'), '⚪')} "
-                                f"**{finding.get('severity', '').upper()}**\n\n"
-                                f"**Issue:** {finding.get('issue')}\n\n"
-                                f"**Why it matters:** {finding.get('why_it_matters')}\n\n"
-                                f"**Suggested fix:** {finding.get('suggested_fix')}"
-                            )
-
-                            if position is not None:
-                                inline_comments.append({
-                                    "path": file_path,
-                                    "position": position,
-                                    "body": comment_text,
-                                })
-                            else:
-                                # The AI's guessed line number didn't land on
-                                # a real diff line — don't lose the finding,
-                                # just fall back to mentioning it in the
-                                # overall summary instead.
-                                unmapped_findings.append(finding)
-
-                        # Step 5: Build the overall summary body
-                        summary_body = (
-                            f"## 🤖 AI Code Review\n\n"
-                            f"**Summary:** {review.get('plain_english_summary')}\n\n"
-                            f"**Impact:** {review.get('impact_summary')}\n"
-                        )
-
-                        if not review.get("findings"):
-                            summary_body += "\nNo significant issues found. ✅"
-
-                        if unmapped_findings:
-                            summary_body += "\n\n### Additional notes (couldn't attach to an exact line)\n"
-                            for f in unmapped_findings:
-                                summary_body += f"- **{f.get('file')}**: {f.get('issue')}\n"
-
-                        # Step 6: Post everything as one review — summary +
-                        # all inline comments together in a single API call.
-                        if inline_comments:
-                            post_pr_review(owner, repo_name, pr_number, installation_token, summary_body, inline_comments)
-                            print(f">> Review posted with {len(inline_comments)} inline comment(s).")
-                        else:
-                            # No findings mapped inline (or no findings at
-                            # all) — just post the summary as a plain comment.
-                            post_pr_comment(owner, repo_name, pr_number, installation_token, summary_body)
-                            print(">> Summary comment posted (no inline comments this time).")
-
-                        # Step 7: Save everything to MySQL for history/dashboard later
-                        save_review(
-                            owner=owner,
-                            repo_name=repo_name,
-                            installation_id=installation_id,
-                            pr_number=pr_number,
-                            pr_title=pr.get("title"),
-                            pr_author=pr.get("user", {}).get("login"),
-                            review_data=review,
-                        )
-                        print(">> Review saved to database.")
-
-            except Exception as e:
-                # We deliberately don't let a failed review crash the whole
-                # webhook handler — we log it and move on. GitHub still gets
-                # a 200 response either way (see below), since the event
-                # itself was received fine even if our review step failed.
-                print(f">> Something went wrong during the review process: {e}")
+            result = run_review_pipeline(
+                owner=repo.get("owner", {}).get("login"),
+                repo_name=repo.get("name"),
+                installation_id=payload.get("installation", {}).get("id"),
+                pr_number=pr.get("number"),
+                pr_title=pr.get("title"),
+                pr_author=pr.get("user", {}).get("login"),
+                post_to_github=True,
+            )
+            print(f">> {result['message']}")
         else:
             print(f">> Ignoring action '{action}' for now.")
     else:
         print("Not a pull_request event — ignoring.")
-        print(json.dumps(payload, indent=2)[:500])  # just a peek, not the whole thing
+        print(json.dumps(payload, indent=2)[:500])
 
-    # GitHub expects a 2xx response quickly, or it will consider the
-    # delivery failed and may retry.
+    # Always 200: the event was received fine even if our review failed.
     return jsonify({"status": "received"}), 200
 
 
+# ---------------------------------------------------------------
+# Dashboard helpers
+# ---------------------------------------------------------------
+SEVERITY_ORDER = {"critical": 0, "warning": 1, "suggestion": 2}
+
+
+def latest_review_for(pr_id):
+    return (
+        Review.query.filter_by(pr_id=pr_id)
+        .order_by(Review.created_at.desc(), Review.id.desc())
+        .first()
+    )
+
+
+def severity_counts(review):
+    counts = {"critical": 0, "warning": 0, "suggestion": 0}
+    if review:
+        for f in review.findings:
+            if f.severity in counts:
+                counts[f.severity] += 1
+    return counts
+
+
+# ---------------------------------------------------------------
+# Dashboard pages
+# ---------------------------------------------------------------
 @app.route("/", methods=["GET"])
+def repos_page():
+    repos = Repository.query.order_by(Repository.owner, Repository.name).all()
+
+    repo_cards = []
+    for repo in repos:
+        totals = {"critical": 0, "warning": 0, "suggestion": 0}
+        for pr in repo.pull_requests:
+            for key, value in severity_counts(latest_review_for(pr.id)).items():
+                totals[key] += value
+        repo_cards.append({"repo": repo, "pr_count": len(repo.pull_requests), "totals": totals})
+
+    return render_template("repos.html", repo_cards=repo_cards)
+
+
+@app.route("/repo/<int:repo_id>", methods=["GET"])
+def repo_page(repo_id):
+    repo = db.session.get(Repository, repo_id)
+    if repo is None:
+        abort(404)
+
+    rows = []
+    for pr in sorted(repo.pull_requests, key=lambda p: p.pr_number, reverse=True):
+        review = latest_review_for(pr.id)
+        rows.append({"pr": pr, "review": review, "counts": severity_counts(review)})
+
+    return render_template("repo_detail.html", repo=repo, rows=rows)
+
+
+@app.route("/pr/<int:pr_id>", methods=["GET"])
+def review_page(pr_id):
+    pr = db.session.get(PullRequest, pr_id)
+    if pr is None:
+        abort(404)
+
+    history = (
+        Review.query.filter_by(pr_id=pr.id)
+        .order_by(Review.created_at.desc(), Review.id.desc())
+        .all()
+    )
+
+    # Show a specific past review if ?review=<id> is given, else the latest
+    selected = None
+    requested_id = request.args.get("review", type=int)
+    if requested_id:
+        selected = next((r for r in history if r.id == requested_id), None)
+    if selected is None and history:
+        selected = history[0]
+
+    findings = []
+    if selected:
+        findings = sorted(
+            selected.findings,
+            key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), f.file_path or "", f.line_number or 0),
+        )
+
+    return render_template(
+        "review_detail.html",
+        pr=pr,
+        repo=pr.repository,
+        review=selected,
+        findings=findings,
+        counts=severity_counts(selected),
+        history=history,
+    )
+
+
+# ---------------------------------------------------------------
+# API used by the dashboard's "Re-run Review" button (via fetch)
+# ---------------------------------------------------------------
+@app.route("/api/pr/<int:pr_id>/rerun", methods=["POST"])
+def rerun_review(pr_id):
+    pr = db.session.get(PullRequest, pr_id)
+    if pr is None:
+        return jsonify({"ok": False, "message": "Pull request not found."}), 404
+
+    repo = pr.repository
+    result = run_review_pipeline(
+        owner=repo.owner,
+        repo_name=repo.name,
+        installation_id=repo.installation_id,
+        pr_number=pr.pr_number,
+        pr_title=pr.title,
+        pr_author=pr.author,
+        post_to_github=False,  # dashboard re-runs don't spam the PR
+    )
+    return jsonify(result), (200 if result["ok"] else 502)
+
+
+@app.route("/health", methods=["GET"])
 def health_check():
-    # Just a simple page so you can confirm the server is alive
-    # by visiting the URL in a browser.
     return "Webhook server is running."
 
 
