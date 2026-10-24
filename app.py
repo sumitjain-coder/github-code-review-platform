@@ -1,5 +1,5 @@
 """
-FLASK APP: WEBHOOK RECEIVER + DASHBOARD
+VERIFLOW — FLASK APP: WEBHOOK RECEIVER + DASHBOARD
 -----------------------------------------
 - /webhook             GitHub sends PR events here (protected by HMAC signature)
 - /                    Dashboard: connected repositories
@@ -14,11 +14,13 @@ import os
 import hmac
 import hashlib
 import json
+from datetime import datetime
 from flask import Flask, request, jsonify, render_template, Response, abort
 from dotenv import load_dotenv
+from sqlalchemy import func
 
 from database import db
-from models import Repository, PullRequest, Review
+from models import Repository, PullRequest, Review, ReviewFinding
 from review_service import run_review_pipeline
 
 load_dotenv()
@@ -70,7 +72,7 @@ def require_dashboard_login():
 
     return Response(
         "Login required.", 401,
-        {"WWW-Authenticate": 'Basic realm="Code Review Dashboard"'},
+        {"WWW-Authenticate": 'Basic realm="VeriFlow"'},
     )
 
 
@@ -163,17 +165,56 @@ def severity_counts(review):
 # ---------------------------------------------------------------
 # Dashboard pages
 # ---------------------------------------------------------------
+PRS_PER_PAGE = 20
+HISTORY_LIMIT = 50
+
+
 @app.route("/", methods=["GET"])
 def repos_page():
-    repos = Repository.query.order_by(Repository.owner, Repository.name).all()
+    repos = Repository.query.all()
+
+    # Three small aggregate queries instead of looping over every PR
+    # and review in Python, so this page stays fast as data grows.
+    pr_counts = dict(
+        db.session.query(PullRequest.repo_id, func.count(PullRequest.id))
+        .group_by(PullRequest.repo_id).all()
+    )
+    last_review = dict(
+        db.session.query(PullRequest.repo_id, func.max(Review.created_at))
+        .join(Review, Review.pr_id == PullRequest.id)
+        .group_by(PullRequest.repo_id).all()
+    )
+
+    # Findings only count from each PR's LATEST review
+    latest_ids = (
+        db.session.query(func.max(Review.id).label("rid"))
+        .group_by(Review.pr_id).subquery()
+    )
+    totals_by_repo = {}
+    severity_rows = (
+        db.session.query(PullRequest.repo_id, ReviewFinding.severity, func.count(ReviewFinding.id))
+        .select_from(PullRequest)
+        .join(Review, Review.pr_id == PullRequest.id)
+        .join(latest_ids, latest_ids.c.rid == Review.id)
+        .join(ReviewFinding, ReviewFinding.review_id == Review.id)
+        .group_by(PullRequest.repo_id, ReviewFinding.severity).all()
+    )
+    for repo_id, severity, count in severity_rows:
+        totals_by_repo.setdefault(repo_id, {})[severity] = count
+
+    # Most recently active repositories first (name order breaks ties)
+    repos.sort(key=lambda r: (r.owner.lower(), r.name.lower()))
+    repos.sort(key=lambda r: last_review.get(r.id) or datetime.min, reverse=True)
 
     repo_cards = []
     for repo in repos:
-        totals = {"critical": 0, "warning": 0, "suggestion": 0}
-        for pr in repo.pull_requests:
-            for key, value in severity_counts(latest_review_for(pr.id)).items():
-                totals[key] += value
-        repo_cards.append({"repo": repo, "pr_count": len(repo.pull_requests), "totals": totals})
+        sev = totals_by_repo.get(repo.id, {})
+        repo_cards.append({
+            "repo": repo,
+            "pr_count": pr_counts.get(repo.id, 0),
+            "last_review": last_review.get(repo.id),
+            "totals": {k: sev.get(k, 0) for k in ("critical", "warning", "suggestion")},
+        })
 
     return render_template("repos.html", repo_cards=repo_cards)
 
@@ -184,12 +225,19 @@ def repo_page(repo_id):
     if repo is None:
         abort(404)
 
+    page = request.args.get("page", 1, type=int)
+    pagination = (
+        PullRequest.query.filter_by(repo_id=repo.id)
+        .order_by(PullRequest.pr_number.desc())
+        .paginate(page=page, per_page=PRS_PER_PAGE, error_out=False)
+    )
+
     rows = []
-    for pr in sorted(repo.pull_requests, key=lambda p: p.pr_number, reverse=True):
+    for pr in pagination.items:
         review = latest_review_for(pr.id)
         rows.append({"pr": pr, "review": review, "counts": severity_counts(review)})
 
-    return render_template("repo_detail.html", repo=repo, rows=rows)
+    return render_template("repo_detail.html", repo=repo, rows=rows, pagination=pagination)
 
 
 @app.route("/pr/<int:pr_id>", methods=["GET"])
@@ -201,16 +249,26 @@ def review_page(pr_id):
     history = (
         Review.query.filter_by(pr_id=pr.id)
         .order_by(Review.created_at.desc(), Review.id.desc())
+        .limit(HISTORY_LIMIT)
         .all()
     )
+    total_reviews = Review.query.filter_by(pr_id=pr.id).count()
 
     # Show a specific past review if ?review=<id> is given, else the latest
     selected = None
     requested_id = request.args.get("review", type=int)
     if requested_id:
-        selected = next((r for r in history if r.id == requested_id), None)
+        selected = Review.query.filter_by(id=requested_id, pr_id=pr.id).first()
     if selected is None and history:
         selected = history[0]
+
+    finding_counts = {}
+    if history:
+        finding_counts = dict(
+            db.session.query(ReviewFinding.review_id, func.count(ReviewFinding.id))
+            .filter(ReviewFinding.review_id.in_([r.id for r in history]))
+            .group_by(ReviewFinding.review_id).all()
+        )
 
     findings = []
     if selected:
@@ -227,6 +285,8 @@ def review_page(pr_id):
         findings=findings,
         counts=severity_counts(selected),
         history=history,
+        total_reviews=total_reviews,
+        finding_counts=finding_counts,
     )
 
 

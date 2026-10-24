@@ -1,16 +1,24 @@
 {% extends "base.html" %}
-{% block title %}Repositories · AI Code Review{% endblock %}
+{% block title %}Repositories · VeriFlow{% endblock %}
 
 {% block content %}
 <h1>Connected repositories</h1>
 <p class="muted">Every repository where the GitHub App is installed and has reviewed at least one pull request.</p>
 
 {% if repo_cards %}
-  <div class="grid">
+  {% if repo_cards|length > 5 %}
+    <input type="search" id="repo-filter" class="search" placeholder="Filter repositories…" aria-label="Filter repositories">
+  {% endif %}
+
+  <div class="grid" id="repo-grid">
     {% for item in repo_cards %}
-      <a class="card card-link" href="{{ url_for('repo_page', repo_id=item.repo.id) }}">
+      <a class="card card-link repo-card" href="{{ url_for('repo_page', repo_id=item.repo.id) }}"
+         data-name="{{ (item.repo.owner ~ '/' ~ item.repo.name)|lower }}">
         <h2>{{ item.repo.owner }}/{{ item.repo.name }}</h2>
-        <p class="muted">{{ item.pr_count }} pull request{{ '' if item.pr_count == 1 else 's' }} reviewed</p>
+        <p class="muted small">
+          {{ item.pr_count }} pull request{{ '' if item.pr_count == 1 else 's' }}
+          {% if item.last_review %}· last review {{ item.last_review.strftime('%d %b %Y') }}{% endif %}
+        </p>
         <div class="badges">
           <span class="badge sev-critical">{{ item.totals.critical }} critical</span>
           <span class="badge sev-warning">{{ item.totals.warning }} warning</span>
@@ -19,6 +27,7 @@
       </a>
     {% endfor %}
   </div>
+  <p id="repo-filter-empty" class="muted" hidden>No repositories match that filter.</p>
 {% else %}
   <div class="card empty">
     <h2>Nothing here yet</h2>

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}{{ repo.owner }}/{{ repo.name }} · AI Code Review{% endblock %}
+{% block title %}{{ repo.owner }}/{{ repo.name }} · VeriFlow{% endblock %}
 
 {% block content %}
 <nav class="crumbs">
@@ -7,7 +7,10 @@
 </nav>
 
 <h1>{{ repo.owner }}/{{ repo.name }}</h1>
-<p class="muted">A pull request (PR) is a proposal to add code changes to a project. Here is every PR the AI has looked at.</p>
+<p class="muted">
+  {{ pagination.total }} pull request{{ '' if pagination.total == 1 else 's' }} reviewed.
+  A pull request (PR) is a proposal to add code changes to a project.
+</p>
 
 {% if rows %}
   <div class="card table-card">
@@ -16,18 +19,20 @@
         <tr>
           <th>PR</th>
           <th>Title</th>
-          <th>Author</th>
+          <th class="hide-sm">Author</th>
           <th>Status</th>
           <th>Findings</th>
-          <th>Last reviewed</th>
+          <th class="hide-sm">Last reviewed</th>
         </tr>
       </thead>
       <tbody>
         {% for row in rows %}
           <tr>
             <td><a href="{{ url_for('review_page', pr_id=row.pr.id) }}">#{{ row.pr.pr_number }}</a></td>
-            <td><a href="{{ url_for('review_page', pr_id=row.pr.id) }}">{{ row.pr.title }}</a></td>
-            <td>{{ row.pr.author }}</td>
+            <td class="truncate" title="{{ row.pr.title }}">
+              <a href="{{ url_for('review_page', pr_id=row.pr.id) }}">{{ row.pr.title }}</a>
+            </td>
+            <td class="hide-sm">{{ row.pr.author }}</td>
             <td>
               {% if row.review %}
                 <span class="badge status-ok">Reviewed</span>
@@ -48,7 +53,7 @@
                 <span class="muted">—</span>
               {% endif %}
             </td>
-            <td class="muted">
+            <td class="muted hide-sm">
               {% if row.review %}{{ row.review.created_at.strftime('%d %b %Y, %H:%M') }} UTC{% else %}—{% endif %}
             </td>
           </tr>
@@ -56,6 +61,22 @@
       </tbody>
     </table>
   </div>
+
+  {% if pagination.pages > 1 %}
+    <nav class="pager" aria-label="Pagination">
+      {% if pagination.has_prev %}
+        <a href="{{ url_for('repo_page', repo_id=repo.id, page=pagination.prev_num) }}">← Newer</a>
+      {% else %}
+        <span class="disabled">← Newer</span>
+      {% endif %}
+      <span class="muted small">Page {{ pagination.page }} of {{ pagination.pages }}</span>
+      {% if pagination.has_next %}
+        <a href="{{ url_for('repo_page', repo_id=repo.id, page=pagination.next_num) }}">Older →</a>
+      {% else %}
+        <span class="disabled">Older →</span>
+      {% endif %}
+    </nav>
+  {% endif %}
 {% else %}
   <div class="card empty"><h2>No pull requests yet</h2></div>
 {% endif %}

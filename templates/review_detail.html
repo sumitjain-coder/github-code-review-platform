@@ -1,5 +1,16 @@
 {% extends "base.html" %}
-{% block title %}PR #{{ pr.pr_number }} · AI Code Review{% endblock %}
+{% block title %}PR #{{ pr.pr_number }} · VeriFlow{% endblock %}
+
+{% macro history_row(r, pr, current, counts) %}
+  <tr>
+    <td>
+      <a href="{{ url_for('review_page', pr_id=pr.id, review=r.id) }}">{{ r.created_at.strftime('%d %b %Y, %H:%M') }} UTC</a>
+      {% if r.id == current.id %}<span class="badge status-ok">viewing</span>{% endif %}
+    </td>
+    {% set n = counts.get(r.id, 0) %}
+    <td class="muted right">{{ n }} finding{{ '' if n == 1 else 's' }}</td>
+  </tr>
+{% endmacro %}
 
 {% block content %}
 <nav class="crumbs">
@@ -28,7 +39,7 @@
 
   <p class="muted small">
     Review from {{ review.created_at.strftime('%d %b %Y, %H:%M') }} UTC
-    {% if history|length > 1 %}· {{ history|length }} reviews in history (see the bottom of this page){% endif %}
+    {% if total_reviews > 1 %}· {{ total_reviews }} reviews in history{% endif %}
   </p>
 
   <section class="explain-grid">
@@ -46,14 +57,21 @@
     <h2>Things the AI found</h2>
 
     {% if findings %}
-      <div class="badges spaced">
-        <span class="badge sev-critical">{{ counts.critical }} critical</span>
-        <span class="badge sev-warning">{{ counts.warning }} warning</span>
-        <span class="badge sev-suggestion">{{ counts.suggestion }} suggestion</span>
+      {# With many findings, the count badges become filters. #}
+      {% set filterable = findings|length > 5 %}
+      <div class="badges spaced"{% if filterable %} id="severity-filters"{% endif %}>
+        {% for key, label in [('critical', 'critical'), ('warning', 'warning'), ('suggestion', 'suggestion')] %}
+          {% if filterable %}
+            <button type="button" class="badge chip sev-{{ key }}" data-filter="{{ key }}" aria-pressed="false">{{ counts[key] }} {{ label }}</button>
+          {% else %}
+            <span class="badge sev-{{ key }}">{{ counts[key] }} {{ label }}</span>
+          {% endif %}
+        {% endfor %}
+        {% if filterable %}<span class="muted small filter-hint">Click a badge to filter</span>{% endif %}
       </div>
 
       {% for f in findings %}
-        <article class="card finding sev-border-{{ f.severity }}">
+        <article class="card finding sev-border-{{ f.severity }}" data-severity="{{ f.severity }}">
           <div class="finding-head">
             <span class="badge sev-{{ f.severity }}">{{ (f.severity or 'note')|upper }}</span>
             <code>{{ f.file_path }}{% if f.line_number %}:{{ f.line_number }}{% endif %}</code>
@@ -77,34 +95,29 @@
     {% endif %}
   </section>
 
-  <section class="card legend">
-    <h2>What do the colours mean?</h2>
-    <p><span class="badge sev-critical">CRITICAL</span> A real bug or security problem. Fix this before merging.</p>
-    <p><span class="badge sev-warning">WARNING</span> Something risky or likely to cause trouble later. Worth fixing.</p>
-    <p><span class="badge sev-suggestion">SUGGESTION</span> A way to make the code cleaner or easier to read. Optional.</p>
-    <p class="muted small">The AI can make mistakes. Treat its findings as a second opinion, not the final word.</p>
-  </section>
-
   {% if history|length > 1 %}
     <section>
       <h2>Review history</h2>
       <div class="card table-card">
         <table>
           <tbody>
-            {% for r in history %}
-              <tr>
-                <td>
-                  <a href="{{ url_for('review_page', pr_id=pr.id, review=r.id) }}">
-                    {{ r.created_at.strftime('%d %b %Y, %H:%M') }} UTC
-                  </a>
-                  {% if r.id == review.id %}<span class="badge status-ok">viewing</span>{% endif %}
-                </td>
-                <td class="muted">{{ r.findings|length }} finding{{ '' if r.findings|length == 1 else 's' }}</td>
-              </tr>
-            {% endfor %}
+            {% for r in history[:5] %}{{ history_row(r, pr, review, finding_counts) }}{% endfor %}
           </tbody>
         </table>
+        {% if history|length > 5 %}
+          <details class="older">
+            <summary>Show {{ history|length - 5 }} older review{{ '' if history|length - 5 == 1 else 's' }}</summary>
+            <table>
+              <tbody>
+                {% for r in history[5:] %}{{ history_row(r, pr, review, finding_counts) }}{% endfor %}
+              </tbody>
+            </table>
+          </details>
+        {% endif %}
       </div>
+      {% if total_reviews > history|length %}
+        <p class="muted small">Showing the {{ history|length }} most recent reviews.</p>
+      {% endif %}
     </section>
   {% endif %}
 

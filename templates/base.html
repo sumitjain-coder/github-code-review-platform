@@ -3,13 +3,19 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}AI Code Review{% endblock %}</title>
+  <title>{% block title %}VeriFlow{% endblock %}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232f6fed'/%3E%3Cpath d='M9 10l7 13 7-13' fill='none' stroke='white' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="{{ url_for('repos_page') }}">🤖 AI Code Review</a>
-    <span class="tagline">Reviews explained in plain English</span>
+    <a class="brand" href="{{ url_for('repos_page') }}">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="16" height="16"><path d="M9 10l7 13 7-13" fill="none" stroke="currentColor" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </span>
+      VeriFlow
+    </a>
+    <span class="tagline">GitHub Code Review Platform</span>
   </header>
 
   <main class="container">
